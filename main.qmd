@@ -1,0 +1,56 @@
+---
+title: "Kaggle Competitions"
+author: "Peter Burke, Jack Krebsbach, Ryan Theurer"
+date: "`r Sys.Date()`"
+format: pdf
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(8675309)
+library(pROC)
+library(splines)
+library(gam)
+library(e1071)
+library(plotly)
+library(tidyverse)
+library(leaps)
+library(boot)
+library(tidymodels)
+library(pander)
+library(GGally)
+library(ggfortify)
+library(class)
+library(MASS)
+library(ISLR2)
+library(glmnet)
+library(pls)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+'%!in%' <- function(x, y){!('%in%'(x, y))}
+```
+
+
+```{r}
+train <- read.csv("data/train.csv")
+test <- read.csv("data/test.csv")
+```
+
+```{r}
+t(t(names(train)))
+```
+
+
+```{r}
+numeric_featuress <- train %>%
+  dplyr::select(is.numeric) %>%
+  slice_sample(n = 100)
+pairs(numeric_featuress)
+```
+
+
+

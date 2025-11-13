@@ -22,9 +22,12 @@ library(boot)
 library(tidymodels)
 library(pander)
 library(GGally)
+library(caret)
 library(ggfortify)
 library(class)
 library(MASS)
+library(xgboost)
+library(caret)
 library(ISLR2)
 library(glmnet)
 library(pls)
@@ -36,8 +39,14 @@ library(dplyr)
 
 
 ```{r}
-train <- read.csv("data/train.csv")
-test <- read.csv("data/test.csv")
+set.seed(86785309)
+data <- read.csv("data/train.csv")
+initial_split <- initial_split(data)
+train <- training(initial_split)
+train$Y <- as.factor(train$Y)
+
+test <- testing(initial_split)
+test$Y <- as.factor(test$Y)
 ```
 
 ```{r}
@@ -51,6 +60,26 @@ numeric_featuress <- train %>%
   slice_sample(n = 100)
 pairs(numeric_featuress)
 ```
+```{r}
+task <- makeClassifTask(data = train, target = "Y", positive = "1")
+task_smote <- mlr::smote(task, rate = 2)
+learner <- makeLearner("classif.xgboost",
+                       predict.type = "prob",
+                       nrounds = 200,           
+                       max_depth = 8,           
+                       eta = 0.1,               
+                       colsample_bytree = 0.9,  
+                       objective = "binary:logistic")
 
+model <- mlr::train(learner, task_smote)
+predictions <- predict(model, newdata = test)
+```
+
+```{r}
+preds <- setThreshold(predictions, 0.45)
+cm_pos <- confusionMatrix(as.factor(test$Y), preds$data$response, positive = "1")
+f1_pos <- cm_pos$byClass["F1"]
+cat("F1 for class 1:", f1_pos, "\n")
+```
 
 

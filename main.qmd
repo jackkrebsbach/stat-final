@@ -20,6 +20,8 @@ library(tidyverse)
 library(leaps)
 library(boot)
 library(tidymodels)
+library(mlr)
+library(ParamHelpers)
 library(pander)
 library(GGally)
 library(caret)
@@ -40,8 +42,11 @@ library(dplyr)
 
 ```{r}
 set.seed(86785309)
-data <- read.csv("data/train.csv")
-initial_split <- initial_split(data)
+data <- read.csv("data/train.csv") |>
+  dplyr::select(c("x1","x2", "x3", "x4","x5", "Y"))
+
+initial_split <- initial_split(data, prop = 8/10)
+
 train <- training(initial_split)
 train$Y <- as.factor(train$Y)
 
@@ -52,31 +57,77 @@ test$Y <- as.factor(test$Y)
 ```{r}
 t(t(names(train)))
 ```
-
+```{r}
+plot(data$x1, data$Y)
+```
 
 ```{r}
 numeric_featuress <- train %>%
-  dplyr::select(is.numeric) %>%
-  slice_sample(n = 100)
+  dplyr::mutate(Y = as.numeric(Y)) %>%
+  slice_sample(n = 1000)
 pairs(numeric_featuress)
 ```
+
 ```{r}
 task <- makeClassifTask(data = train, target = "Y", positive = "1")
-task_smote <- mlr::smote(task, rate = 2)
+task_smote <- mlr::smote(task, rate = 1)
 learner <- makeLearner("classif.xgboost",
                        predict.type = "prob",
                        nrounds = 200,           
-                       max_depth = 8,           
+                       max_depth = 9,           
                        eta = 0.1,               
                        colsample_bytree = 0.9,  
                        objective = "binary:logistic")
-
 model <- mlr::train(learner, task_smote)
 predictions <- predict(model, newdata = test)
 ```
 
 ```{r}
-preds <- setThreshold(predictions, 0.45)
+task <- makeClassifTask(data = train, target = "Y", positive = "1")
+task_smote <- mlr::smote(task, rate = 1)
+
+learner <- makeLearner("classif.xgboost",
+                       predict.type = "prob",
+                       objective = "binary:logistic")
+
+param_set <- makeParamSet(
+  makeIntegerParam("nrounds", lower = 50, upper = 300),
+  makeIntegerParam("max_depth", lower = 3, upper = 10),
+  makeNumericParam("eta", lower = 0.01, upper = 0.3),
+  makeNumericParam("colsample_bytree", lower = 0.5, upper = 1),
+  makeNumericParam("subsample", lower = 0.5, upper = 1),
+  makeNumericParam("min_child_weight", lower = 1, upper = 10),
+  makeNumericParam("gamma", lower = 0, upper = 5)
+)
+
+resample_desc <- makeResampleDesc("CV", iters = 5, stratify = TRUE)
+
+# ctrl_random <- makeTuneControlRandom(maxit = 50)  
+ctrl_grid <- makeTuneControlGrid()
+
+tune_result <- tuneParams(
+  learner = learner,
+  task = task_smote,
+  resampling = resample_desc,
+  measures = list(mlr::f1),
+  par.set = param_set,
+  control = ctrl_grid,
+  show.info = TRUE
+)
+
+print(tune_result$x)
+print(tune_result$y)
+```
+
+```{r}
+learner_tuned <- setHyperPars(learner, par.vals = tune_result$x)
+model_tuned <- mlr::train(learner_tuned, task_smote)
+saveRDS(learner_tuned, "./outputs/learner_tuned.rds")
+saveRDS(model_tuned, "./outputs/model_tuned.rds")
+```
+
+```{r}
+preds <- setThreshold(predictions, 0.25)
 cm_pos <- confusionMatrix(as.factor(test$Y), preds$data$response, positive = "1")
 f1_pos <- cm_pos$byClass["F1"]
 cat("F1 for class 1:", f1_pos, "\n")

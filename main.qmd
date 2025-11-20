@@ -16,11 +16,11 @@ library(splines)
 library(gam)
 library(e1071)
 library(plotly)
+library(caret)
 library(tidyverse)
 library(leaps)
 library(boot)
 library(tidymodels)
-library(mlr)
 library(ParamHelpers)
 library(pander)
 library(GGally)
@@ -36,101 +36,264 @@ library(pls)
 library(ggplot2)
 library(gridExtra)
 library(dplyr)
+library(mlr3)
+library(mlr3learners)
+library(mlr3extralearners)
+library(smotefamily)
+library(rpart.plot)
 '%!in%' <- function(x, y){!('%in%'(x, y))}
+```
+
+```{r}
+data_full <- read.csv("data/train.csv") 
+data_full$Y <- factor(data$Y, levels = c("1", "0"))
+```
+
+```{r}
+numeric_featuress <- data_full %>%
+  dplyr::mutate(Y = as.numeric(Y)) %>%
+  slice_sample(n = 100)
+pairs(numeric_featuress)
+```
+```{r}
+plot(data$x10, data$Y)
 ```
 
 
 ```{r}
 set.seed(86785309)
-data <- read.csv("data/train.csv") |>
-  dplyr::select(c("x1","x2", "x3", "x4","x5", "Y"))
+data <- data_full |>
+  dplyr::select(c("x1","x2", "x3", "x4","x5","Y")) |>
+  dplyr::mutate(Y = as.factor(Y))
+initial_split <- initial_split(data, prop = 8/10, strata = Y)
+train <- training(initial_split)
+test <- testing(initial_split)
+```
 
-initial_split <- initial_split(data, prop = 8/10)
+
+## CV GLMNet
+
+```{r}
+set.seed(8675309)
+grid <- 10^seq(10, -2, length = 1000)
+train.X <- model.matrix(Y ~ ., train)[,-1]
+train.Y <- as.numeric(train$Y)
+lasso.cv.out <- cv.glmnet(train.X, train.Y, alpha = 1, lambda = grid)
+plot(lasso.cv.out)
+```
+
+```{r}
+bestlam <- lasso.cv.out$lambda.min
+cat(bestlam)
+lasso.coef <- predict(lasso.cv.out, type = "coefficients", s = lasso.cv.out$lambda.min, exact = T)
+lasso.coef
+```
+
+## Decision Tree
+
+Validated that features 1-5 are most important.
+
+```{r}
+tsk <- as_task_classif(train, target = "Y")
+learner_tree <- mlr3::lrn("classif.rpart", predict_type = "prob")
+learner_tree$train(tsk)
+
+importance <- learner_tree$importance()
+print(importance)
+```
+
+```{r}
+rpart.plot(learner_tree$model, 
+           type = 4, 
+           extra = 101,
+           box.palette = "RdYlGn",
+           main = "Decision Tree for Feature Importance")
+
+importance_df <- data.frame(
+  feature = names(importance),
+  importance = as.numeric(importance)
+)
+importance_df <- importance_df[order(-importance_df$importance), ]
+print(importance_df)
+```
+
+## XGBoost
+
+```{r}
+tsk <- as_task_classif(train, target = "Y")
+learner<- mlr3::lrn("classif.xgboost", predict_type = "prob", objective = "binary:logistic")
+
+pset <- ps(
+    nrounds = p_int(50, 150),
+    max_depth = p_int(2, 5),
+    eta = p_dbl(0.01, 0.3),
+    colsample_bytree = p_dbl(0.5, 1)
+  )
+
+resampling <- rsmp("cv", folds = 3)
+measure <- msr("classif.fbeta", beta = 1, na_value = 0) 
+tuner <- tnr("random_search")
+#terminator <- trm("evals", n_evals = 3)
+terminator <- trm("combo",
+  list(
+    trm("perf_reached", level = 0.745),
+    trm("evals", n_evals = 3)
+  ),
+  any = TRUE 
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = pset,
+  tuner = tuner,
+  terminator = terminator
+)
+
+optimizer <- opt("grid_search", resolution = 50)
+graph <- po("learner_cv", at) %>>% 
+         po("tunethreshold", 
+            measure = msr("classif.fbeta", beta = 1, na_value = 0),
+            optimizer = optimizer)
+
+graph_learner <- GraphLearner$new(graph)
+
+plan(multisession, workers = 4)
+
+graph_learner$train(tsk)
+
+preds <- graph_learner$predict_newdata(test)
+preds$score(measure)
+```
+
+## Random Forest
+
+```{r}
+tsk <- as_task_classif(train, target = "Y", id = "default")
+learner <- mlr3::lrn("classif.randomForest",
+                      ntree = 300,
+                      mtry = 5
+                     )
+learner$train(tsk)
+preds <- learner$predict_newdata(test)
+```
+
+```{r}
+measure <- msr("classif.fbeta", beta = 1, na_value = 0) 
+preds$score(measure)
+```
+
+## Gaussian Processes for Classification
+
+```{r}
+tsk <- as_task_classif(data, target = "Y", id = "default")
+learner <- mlr3::lrn("classif.gausspr")
+splits <- partition(tsk, ratio = 0.7)
+learner$train(tsk)
+preds <- learner$predict_newdata(test)
+measure <- msr("classif.fbeta", beta = 1, na_value = 0) 
+preds$score(measure)
+```
+
+## Principal Compoments
+
+```{r}
+set.seed(86785309)
+
+data <- read.csv("data/train.csv")
+data$Y <- factor(data$Y, levels = c("1", "0"))
+
+initial_split <- initial_split(data, prop = 8/10, strata = Y)
 
 train <- training(initial_split)
-train$Y <- as.factor(train$Y)
-
 test <- testing(initial_split)
-test$Y <- as.factor(test$Y)
+
+train_pred <- train |>
+  dplyr::select(-Y)
+
+train_Y <-  train |>
+  dplyr::select(Y) |>
+  dplyr::mutate(Y = as.factor(Y))
+
+test_pred <- test |>
+  dplyr::select(-Y)
+
+test_Y <-  test |>
+  dplyr::select(Y) |>
+  dplyr::mutate(Y = as.factor(Y))
+  
+pc <- stats::princomp(train_pred)
+
+train_pc <- as_tibble(pc$scores) |>
+  dplyr::select(-c("Comp.1", "Comp.2", "Comp.3", "Comp.4", "Comp.5")) |>
+  cbind(train_Y)
+
+test_pc <- as_tibble(predict(pc, newdata = test_pred)) |>
+  dplyr::select(-c("Comp.1", "Comp.2", "Comp.3", "Comp.4", "Comp.5")) |>
+  cbind(test_Y)
 ```
 
 ```{r}
-t(t(names(train)))
-```
-```{r}
-plot(data$x1, data$Y)
-```
+task <- mlr3::TaskClassif$new(id = "train_task", 
+                               backend = train_pc, 
+                               target = "Y", 
+                               positive = "1")
 
-```{r}
-numeric_featuress <- train %>%
-  dplyr::mutate(Y = as.numeric(Y)) %>%
-  slice_sample(n = 1000)
-pairs(numeric_featuress)
-```
+learner <- mlr3::lrn("classif.xgboost",
+                     predict_type = "prob",
+                     nrounds = 100,
+                     max_depth = 4,
+                     eta = 0.2,
+                     colsample_bytree = 0.7,
+                     objective = "binary:logistic")
 
-```{r}
-task <- makeClassifTask(data = train, target = "Y", positive = "1")
-task_smote <- mlr::smote(task, rate = 1)
-learner <- makeLearner("classif.xgboost",
-                       predict.type = "prob",
-                       nrounds = 200,           
-                       max_depth = 9,           
-                       eta = 0.1,               
-                       colsample_bytree = 0.9,  
-                       objective = "binary:logistic")
-model <- mlr::train(learner, task_smote)
-predictions <- predict(model, newdata = test)
+po_smote <- po("smote", dup_size = 1) 
+graph <- po_smote %>>% po("learner", learner)
+graph_learner <- as_learner(graph)
+
+graph_learner$train(task)
+
+predictions <- graph_learner$predict_newdata(test_pc)
 ```
 
 ```{r}
-task <- makeClassifTask(data = train, target = "Y", positive = "1")
-task_smote <- mlr::smote(task, rate = 1)
-
-learner <- makeLearner("classif.xgboost",
-                       predict.type = "prob",
-                       objective = "binary:logistic")
-
-param_set <- makeParamSet(
-  makeIntegerParam("nrounds", lower = 50, upper = 300),
-  makeIntegerParam("max_depth", lower = 3, upper = 10),
-  makeNumericParam("eta", lower = 0.01, upper = 0.3),
-  makeNumericParam("colsample_bytree", lower = 0.5, upper = 1),
-  makeNumericParam("subsample", lower = 0.5, upper = 1),
-  makeNumericParam("min_child_weight", lower = 1, upper = 10),
-  makeNumericParam("gamma", lower = 0, upper = 5)
-)
-
-resample_desc <- makeResampleDesc("CV", iters = 5, stratify = TRUE)
-
-# ctrl_random <- makeTuneControlRandom(maxit = 50)  
-ctrl_grid <- makeTuneControlGrid()
-
-tune_result <- tuneParams(
-  learner = learner,
-  task = task_smote,
-  resampling = resample_desc,
-  measures = list(mlr::f1),
-  par.set = param_set,
-  control = ctrl_grid,
-  show.info = TRUE
-)
-
-print(tune_result$x)
-print(tune_result$y)
+predictions$set_threshold(0.05)
+measure <- msr("classif.fbeta", beta = 1, na_value = 0) 
+predictions$score(measure)
 ```
+
+## Validation
 
 ```{r}
-learner_tuned <- setHyperPars(learner, par.vals = tune_result$x)
-model_tuned <- mlr::train(learner_tuned, task_smote)
-saveRDS(learner_tuned, "./outputs/learner_tuned.rds")
-saveRDS(model_tuned, "./outputs/model_tuned.rds")
+validation_data <- read.csv("data/test.csv")
+validation <- validation_data |>
+  dplyr::select(c("x1","x2", "x3","x4","x5"))
+
+template <- read.csv("data/sample_submission.csv")
+
+full_task <- as_task_classif(data, target = "Y", id = "full_train")
+learner <- mlr3::lrn("classif.xgboost",
+                      predict_type = "prob",
+                      nrounds = 100,
+                      max_depth = 3,
+                      eta = 0.2,
+                      colsample_bytree = 0.9,
+                      objective = "binary:logistic")
+
+learner$train(full_task)
+
+preds <- learner$predict_newdata(validation)
+preds$set_threshold(best_threshold)
+
+submission <- tibble(ID = validation_data$ID, Y=preds$response)
+submission
+#write.csv(submission, "outputs/4_submission_jack.csv", row.names = F)
 ```
+
+
+## Tuned Models
 
 ```{r}
-preds <- setThreshold(predictions, 0.25)
-cm_pos <- confusionMatrix(as.factor(test$Y), preds$data$response, positive = "1")
-f1_pos <- cm_pos$byClass["F1"]
-cat("F1 for class 1:", f1_pos, "\n")
+gl_xgboost_tuned <- readRDS("outputs/xgboost_gl_tuned.rds")
 ```
-
-

@@ -40,28 +40,63 @@ library(mlr3)
 library(mlr3learners)
 library(mlr3extralearners)
 library(smotefamily)
+library(rpart)
 library(rpart.plot)
+library(mlr3fselect)
 '%!in%' <- function(x, y){!('%in%'(x, y))}
 ```
 
 ```{r}
 data_full <- read.csv("data/train.csv") 
-data_full$Y <- factor(data$Y, levels = c("1", "0"))
+data_full$Y <- factor(data_full$Y, levels = c("1", "0"))
 ```
 
 ```{r}
-numeric_featuress <- data_full %>%
-  dplyr::mutate(Y = as.numeric(Y)) %>%
-  slice_sample(n = 100)
-pairs(numeric_featuress)
+data <- data_full |>
+  dplyr::select(c("x1","x2", "x3", "x4","x5")) |>
+  slice_sample(n=1000)
+ggpairs(data)
 ```
+
 ```{r}
-plot(data$x10, data$Y)
+numeric_features <- data_full %>%
+  dplyr::select(-Y) %>%
+  slice_sample(n = 100) 
+#pairs(numeric_featuress)
+
+gaussian_features <- numeric_features %>%
+  mutate(across(where(is.numeric), ~ {
+    dens <- density(.x, kernel = "gaussian")
+    # interpolate back to original values
+    approx(dens$x, dens$y, xout = .x)$y
+  }))
+
+cor(gaussian_features)
+```
+
+```{r}
+data <-  data_full |>
+  slice_sample(n=20000)
+
+ggplot(data, aes(x = x6, y = Y)) +
+  geom_point(alpha = 0.6, size = 2.5, color = "#2E86AB") +
+  labs(
+    title = "Response vs X6",
+    x = "X6",
+    y = "Y"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 11),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "grey80", fill = NA, linewidth = 0.5)
+  )
 ```
 
 
 ```{r}
-set.seed(86785309)
+set.seed(8675309)
 data <- data_full |>
   dplyr::select(c("x1","x2", "x3", "x4","x5","Y")) |>
   dplyr::mutate(Y = as.factor(Y))
@@ -70,14 +105,12 @@ train <- training(initial_split)
 test <- testing(initial_split)
 ```
 
-
 ## CV GLMNet
 
 ```{r}
-set.seed(8675309)
 grid <- 10^seq(10, -2, length = 1000)
-train.X <- model.matrix(Y ~ ., train)[,-1]
-train.Y <- as.numeric(train$Y)
+train.X <- model.matrix(Y ~ ., data_full)[,-1]
+train.Y <- as.numeric(data_full$Y)
 lasso.cv.out <- cv.glmnet(train.X, train.Y, alpha = 1, lambda = grid)
 plot(lasso.cv.out)
 ```
@@ -94,27 +127,60 @@ lasso.coef
 Validated that features 1-5 are most important.
 
 ```{r}
-tsk <- as_task_classif(train, target = "Y")
-learner_tree <- mlr3::lrn("classif.rpart", predict_type = "prob")
-learner_tree$train(tsk)
-
-importance <- learner_tree$importance()
-print(importance)
+tsk <- as_task_classif(data_full, target = "Y")
+learner <- mlr3::lrn("classif.rpart", predict_type = "prob")
+measure <- msr("classif.fbeta", beta = 1, na_value = 0) 
+learner$train(tsk)
 ```
 
 ```{r}
-rpart.plot(learner_tree$model, 
+rpart.plot(learner$model, 
            type = 4, 
            extra = 101,
            box.palette = "RdYlGn",
            main = "Decision Tree for Feature Importance")
 
+importance <- learner$model$variable.importance
+
 importance_df <- data.frame(
   feature = names(importance),
   importance = as.numeric(importance)
 )
+
 importance_df <- importance_df[order(-importance_df$importance), ]
 print(importance_df)
+```
+
+```{R}
+instance = mlr3fselect::fselect(
+  fselector = fs("sequential"),
+  task =  tsk,
+  learner = learner,
+  resampling = rsmp("cv", folds = 3),
+  measure = measure
+)
+
+autoplot(instance, type = "performance")
+```
+
+## QDA
+
+```{r}
+tsk <- as_task_classif(train, target = "Y")
+learner <- mlr3::lrn("classif.qda", predict_type = "prob")
+
+optimizer <- opt("grid_search", resolution = 50)
+graph <- po("learner_cv", learner) %>>% 
+         po("tunethreshold", 
+            measure = msr("classif.fbeta", beta = 1, na_value = 0),
+            optimizer = optimizer)
+
+graph_learner <- GraphLearner$new(graph)
+
+graph_learner$train(tsk)
+
+preds <- graph_learner$predict_newdata(test)
+preds$score(measure)
 ```
 
 ## XGBoost
@@ -171,15 +237,46 @@ preds$score(measure)
 
 ```{r}
 tsk <- as_task_classif(train, target = "Y", id = "default")
-learner <- mlr3::lrn("classif.randomForest",
-                      ntree = 300,
-                      mtry = 5
-                     )
-learner$train(tsk)
-preds <- learner$predict_newdata(test)
-```
+learner <- mlr3::lrn("classif.ranger", num.trees = 300, mtry = 3,
+                     min.node.size = 2, max.depth = 10, predict_type = "prob")
+pset <- ps(
+  num.trees = p_int(200, 350),
+  mtry = p_int(3, 5),  
+  min.node.size = p_int(2, 8),
+  max.depth = p_int(3, 8)
+)
 
-```{r}
+resampling <- rsmp("cv", folds = 3)
+measure <- msr("classif.fbeta", beta = 1, na_value = 0)
+tuner <- tnr("random_search")
+#terminator <- trm("evals", n_evals = 2000)
+terminator <- trm("combo",
+  list(
+    trm("perf_reached", level = 0.745),
+    trm("evals", n_evals = 100)
+  ),
+  any = TRUE
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = pset,
+  tuner = tuner,
+  terminator = terminator
+)
+
+optimizer <- opt("grid_search", resolution = 50)
+graph <- po("learner_cv", learner) %>>% 
+         po("tunethreshold", 
+            measure = msr("classif.fbeta", beta = 1, na_value = 0),
+            optimizer = optimizer)
+
+graph_learner <- GraphLearner$new(graph)
+
+graph_learner$train(tsk)
+preds <- graph_learner$predict_newdata(test)
 measure <- msr("classif.fbeta", beta = 1, na_value = 0) 
 preds$score(measure)
 ```
@@ -269,7 +366,6 @@ predictions$score(measure)
 validation_data <- read.csv("data/test.csv")
 validation <- validation_data |>
   dplyr::select(c("x1","x2", "x3","x4","x5"))
-
 template <- read.csv("data/sample_submission.csv")
 
 full_task <- as_task_classif(data, target = "Y", id = "full_train")
@@ -290,7 +386,6 @@ submission <- tibble(ID = validation_data$ID, Y=preds$response)
 submission
 #write.csv(submission, "outputs/4_submission_jack.csv", row.names = F)
 ```
-
 
 ## Tuned Models
 
